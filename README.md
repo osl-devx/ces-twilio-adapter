@@ -1,8 +1,25 @@
 # CES Twilio Adapter
 
-This repository contains a telephony adapter to connect Twilio with Google Cloud's conversational AI agents. It acts as a bridge, receiving voice calls from Twilio, dynamically routing them to the correct AI agent based on the dialed phone number, forwarding the audio stream to the agent via WebSocket, and streaming the agent's audio response back to the caller through Twilio.
+This repository contains a telephony adapter to connect Twilio with Google Cloud's conversational AI agents. It acts as a bridge for both voice and messaging, supporting voice calls, SMS, and Rich Communication Services (RCS). The adapter receives incoming requests from Twilio, dynamically routes them to the correct AI agent based on the phone number or sender ID, and facilitates the conversation between the user and the agent.
 
 The application is designed to be deployed as a Google Cloud Run service.
+
+## Table of Contents
+
+*   [Deployment to Cloud Run](#deployment-to-cloud-run)
+    *   [1. Prerequisites](#1-prerequisites)
+    *   [2. Configuration](#2-configuration)
+    *   [3. Phone Number to Agent Mapping](#3-phone-number-to-agent-mapping)
+    *   [4. Secrets and Authentication Setup](#4-secrets-and-authentication-setup)
+    *   [5. Grant IAM Permissions](#5-grant-iam-permissions)
+    *   [6. Deploy the Service](#6-deploy-the-service)
+    *   [7. Final Configuration](#7-final-configuration)
+*   [Local Development & Testing](#8-local-development--testing)
+*   [Important Notes](#9-important-notes)
+
+### What is RCS?
+
+Rich Communication Services (RCS) is a modern messaging protocol that upgrades traditional SMS with features like typing indicators, read receipts, high-resolution photo sharing, and group chats. Twilio's Rich Communication Services (RCS) Business Messaging is available globally, now including iOS devices running iOS 18.2 or newer, and features automatic SMS fallback for incompatible phones. This adapter allows your conversational agent to interact with users via RCS through Twilio.
 
 ## Deployment to Cloud Run
 
@@ -60,7 +77,7 @@ TIMEOUT=60m
 
 ### 3. Phone Number to Agent Mapping
 
-This adapter dynamically maps an incoming phone number to a specific conversational agent. This allows you to change which agent answers a call without redeploying the service. You can configure this mapping using either Firestore (for dynamic, remote configuration) or a local JSON file (for simple, static configuration).
+This adapter dynamically maps an incoming phone number (for voice and SMS) or an RCS Sender ID to a specific conversational agent. This allows you to change which agent handles a conversation without redeploying the service. You can configure this mapping using either Firestore (for dynamic, remote configuration) or a local JSON file (for simple, static configuration).
 
 Choose **one** of the following methods and configure the corresponding environment variable in `script/values.sh`.
 
@@ -72,7 +89,9 @@ Using Firestore allows you to update phone number mappings without redeploying t
 
 **Data Structure:**
 *   **Collection ID:** The name you specified for `NUMBERS_COLLECTION_ID` (e.g., `ces-twilio-adapter-mappings`).
-*   **Document ID:** The Twilio phone number in E.164 format (e.g., `+18005551212`).
+*   **Document ID:**
+    *   **For Voice and SMS:** The Twilio phone number in E.164 format (e.g., `+18005551212`).
+    *   **For RCS:** The RCS sender ID, prefixed with `rcs:`. For example, if your RCS sender in Twilio is named `my-rcs-sender_abcdeabcde_agent`, the document ID would be `rcs:my-rcs-sender_abcdeabcde_agent`.
 *   **Fields:**
     *   `deployment_id` (string): **(Preferred)** The full resource name of a specific agent deployment. This is the recommended way to specify an agent, as it pins the adapter to a specific version of your agent.
         *   Example: `projects/your-gcp-project-id/locations/us-east1/apps/app-id/deployments/deployment-id`
@@ -114,17 +133,22 @@ For simpler setups or local testing, you can use a JSON file to define the mappi
 **Data Structure:**
 The JSON file should be an object where keys are the Twilio phone numbers in E.164 format and values are objects containing the `agent_id` and an optional `environment` field.
 The preferred method is to provide a `deployment_id`, which will always take precedence over `agent_id`.
+*   **For Voice and SMS:** The key is the phone number in E.164 format.
+*   **For RCS:** The key is the RCS sender ID, prefixed with `rcs:`.
 
 **Example `number_mappings.json`:**
+This example shows mappings for a standard phone number (handling voice and SMS) and an RCS sender.
+
 ```json
 {
   "+18005551212": {
     "deployment_id": "projects/your-gcp-project-id/locations/us-east1/apps/app-id/deployments/deployment-id",
-    "environment": "dev"
   },
   "+18005551213": {
     "deployment_id": "projects/your-gcp-project-id/locations/us-east1/apps/another-app-id/deployments/another-deployment-id"
-    // The 'environment' field is optional and defaults to "prod" if omitted.
+  },
+  "rcs:my-rcs-sender_abcdeabcde_agent": {
+    "deployment_id": "projects/your-gcp-project-id/locations/us-east1/apps/rcs-app-id/deployments/rcs-deployment-id"
   }
 }
 ```
@@ -198,13 +222,15 @@ To enable this method, you set the `AUTH_TOKEN_SECRET_PATH` environment variable
 Before the first deployment, you must manually grant the service account the necessary IAM roles to access project resources. The `deploy.sh` script does **not** handle these permissions, so granting them explicitly ensures the service has the required access from the start.
 
 1.  **Grant Firestore Access:** Allows the service to read the phone number-to-agent mappings.
+    **Note:** This permission is only required if you are using Firestore for phone number mapping (i.e., `NUMBERS_COLLECTION_ID` is set in `script/values.sh`).
     ```bash
     gcloud projects add-iam-policy-binding $(gcloud config get-value project) \
         --member="serviceAccount:$(bash -c 'source script/values.sh && echo $SERVICE_ACCOUNT')" \
         --role="roles/datastore.user"
     ```
 
-2.  **Grant Agent Token Secret Access:** Allows the service to read the agent's OAuth2 token from Secret Manager at runtime.
+2.  **Grant Agent Token Secret Access:** Allows the service to read the agent's OAuth2 token from Secret Manager.
+    **Note:** This permission is only required if you are using the Secret Manager override method for agent authentication (i.e., `AUTH_TOKEN_SECRET_PATH` is set in `script/values.sh`). If you are using the default Application Default Credentials method, this step can be skipped.
     ```bash
     gcloud secrets add-iam-policy-binding ces-twilio-adapter-token \
         --member="serviceAccount:$(bash -c 'source script/values.sh && echo $SERVICE_ACCOUNT')" \
@@ -212,7 +238,7 @@ Before the first deployment, you must manually grant the service account the nec
         --project=$(gcloud config get-value project)
     ```
 
-3.  **Grant Twilio Token Secret Access:** Allows the Cloud Run service to mount the Twilio Auth Token as an environment variable.
+3.  **Grant Twilio Token Secret Access:** Allows the Cloud Run service to mount the Twilio Auth Token as an environment variable. This permission is always required for the adapter to validate incoming requests from Twilio.
     ```bash
     gcloud secrets add-iam-policy-binding ces-twilio-auth-token \
         --member="serviceAccount:$(bash -c 'source script/values.sh && echo $SERVICE_ACCOUNT')" \
@@ -235,17 +261,28 @@ This command will build the container image from the source, push it to Artifact
 1.  **Update Service Hostname:** After the first deployment, Cloud Run will assign a public URL to your service. Copy this URL.
     *   Open `script/values.sh` and update the `PUBLIC_SERVER_HOSTNAME` variable with your service's hostname (e.g., `ces-twilio-adapter-xxxx.a.run.app`).
     *   Redeploy the service by running `bash script/deploy.sh` again so the application has its own public address.
-    *   Open `script/values.sh` and update the `PUBLIC_SERVER_HOSTNAME` variable with your service's hostname (e.g., `ces-twilio-adapter-xxxx.a.run.app`).
-    *   Redeploy the service by running `bash script/deploy.sh` again so the application has its own public address.
 
 2.  **Configure Twilio Webhook:**
-    *   Go to your Twilio console and navigate to the settings for your phone number.
-    *   Under "Voice & Fax", configure the "A CALL COMES IN" webhook to point to your service's endpoint. The URL will be: `https://<YOUR_PUBLIC_SERVER_HOSTNAME>/twilio/voice`
-    *   Set the HTTP method to `HTTP POST`.
+    Go to your Twilio console and configure the appropriate webhooks for the services you want to use.
+
+    *   **For Voice:**
+        *   Navigate to your phone number's settings.
+        *   Under "Voice & Fax", configure the "A CALL COMES IN" webhook to point to your service's voice endpoint: `https://<YOUR_PUBLIC_SERVER_HOSTNAME>/incoming-call`
+        *   Set the HTTP method to `HTTP POST`.
+
+    *   **For SMS:**
+        *   Navigate to your phone number's settings.
+        *   Under "Messaging", configure the "A MESSAGE COMES IN" webhook to point to your service's messaging endpoint: `https://<YOUR_PUBLIC_SERVER_HOSTNAME>/incoming-message`
+        *   Set the HTTP method to `HTTP POST`.
+
+    *   **For RCS:**
+        *   Navigate to your RCS sender's configuration in the Twilio console.
+        *   Configure the webhook to point to the same messaging endpoint: `https://<YOUR_PUBLIC_SERVER_HOSTNAME>/incoming-message`
+        *   Set the HTTP method to `HTTP POST`.
 
 Your adapter is now live.
 
-## 8. Local Development & Testing
+## Local Development & Testing
 
 For faster development cycles, you can run the server locally and expose it to the internet using `ngrok`. This is easy to do from a local machine or a Cloud Shell instance.
 
@@ -261,7 +298,7 @@ For faster development cycles, you can run the server locally and expose it to t
 
 ### 2. Run Locally
 
-**Important Note for Googlers:** Do not install and run `ngrok` on your workstation within the corporate network. Instead, use Cloud Shell within your Google Cloud project. The `script/setup-cloud-shell.sh` script is provided for easy setup within Cloud Shell.
+**Important Security Note:** If you are working within a corporate network, running tools like `ngrok` on your workstation can expose internal network resources to the public internet, which may violate your company's security policies. Before proceeding, consult with your security team to understand the approved procedures for such tasks. They may provide a specific development environment or machine for this purpose. If your company's policy allows, using a sandboxed environment like Google Cloud Shell can be a safer alternative. The `script/setup-cloud-shell.sh` script is provided for easy setup within Cloud Shell.
 
 1.  **Start `ngrok`:** In a terminal, start `ngrok` to create a public tunnel to your local port 8080.
     ```bash
@@ -295,12 +332,16 @@ For faster development cycles, you can run the server locally and expose it to t
 
 You can now call your Twilio number, and the request will be forwarded to your local machine for debugging.
 
-## 9. Important Notes
+## Important Notes
 
 *   **Token Expiration (Override Method):** If you are using the Secret Manager override for authentication, remember that the access token expires (typically after 1 hour). For a production deployment, you will need to periodically run the `gcloud secrets versions add ...` command to update the secret with a fresh token. A more robust, long-term solution would involve a mechanism to programmatically refresh and update the token.
 *   **Service Hostname:** The application needs to know its own public hostname to correctly configure Twilio TwiML responses. This creates a small circular dependency during the first deployment, which is why you must deploy, update the hostname in `script/values.sh`, and then redeploy.
 *   **Permissions:** The service account used by Cloud Run (`ces-twilio-adapter@${PROJECT_ID}.iam.gserviceaccount.com` by default) requires specific IAM roles to function correctly:
-    *   **Firestore Access:** It needs the `Cloud Datastore User` role (`roles/datastore.user`) to read the phone number to agent mappings.
-    *   **Agent Token Secret Access:** It needs the `Secret Manager Secret Accessor` role (`roles/secretmanager.secretAccessor`) for the Agent Auth Token secret.
-    *   **Twilio Token Secret Access:** It needs the `Secret Manager Secret Accessor` role (`roles/secretmanager.secretAccessor`) for the Twilio Auth Token secret.
+    *   **Firestore Access (Conditional):** It needs the `Cloud Datastore User` role (`roles/datastore.user`) only if you are using Firestore for number mapping.
+    *   **Agent Token Secret Access (Conditional):** It needs the `Secret Manager Secret Accessor` role (`roles/secretmanager.secretAccessor`) for the Agent Auth Token secret only if you are using the Secret Manager override method for authentication.
+    *   **Twilio Token Secret Access (Required):** It always needs the `Secret Manager Secret Accessor` role (`roles/secretmanager.secretAccessor`) for the Twilio Auth Token secret to validate incoming requests.
     
+*   **SMS & RCS Compliance:**
+    *   **For SMS:** To send messages from your Twilio numbers to any destination, you will need to register your brand and campaign with Twilio's compliance department, typically by submitting a compliance bundle.
+    *   **For RCS:** You will similarly need to request carrier approval of your branding. Until your brand is approved, you can only send messages to specific test numbers that you define in the Twilio console.
+    *   **Note:** The process of brand registration, campaign approval, and lifting sending restrictions for both SMS and RCS is handled between you and Twilio and is out of the scope of this guide and the capabilties of this adapter.
