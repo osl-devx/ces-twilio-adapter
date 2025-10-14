@@ -156,10 +156,10 @@ async def process_incoming_message(
 
                 if (
                     va_response
-                    and "sessionOutput" in va_response
-                    and va_response["sessionOutput"]
+                    and "outputs" in va_response
+                    and va_response["outputs"]
                 ):
-                    reply_text = va_response["sessionOutput"][0].get("text")
+                    reply_text = va_response["outputs"][0].get("text")
                     if reply_text:
                         logger.info(
                             f"Sending reply from VA to {from_number}: '{reply_text}'"
