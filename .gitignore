@@ -11,7 +11,7 @@
 *.credentials.json
 gcp_credentials.json
 service-account*.json
-
+number_mappings.json
 # Orchestrator settings (contains Twilio auth token + GCP private key)
 orchestrator-settings.json
 
