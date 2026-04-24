@@ -1,18 +1,71 @@
+# ==============================================================================
+# Sensitive files — credentials, secrets, and environment configuration
+# ==============================================================================
+
+# Environment files (contain API keys, auth tokens, private config)
+.env
+.env.*
+!.env.example
+
+# GCP service account key file
+*.credentials.json
+gcp_credentials.json
+service-account*.json
+
+# Orchestrator settings (contains Twilio auth token + GCP private key)
+orchestrator-settings.json
+
+# Deployment values (contains project-specific config and secret paths)
+script/values.sh
+
+# Phone number mappings (operational config — may contain deployment IDs)
+# Uncomment the next line if mappings should not be committed:
+# number_mappings.json
+
+# ==============================================================================
 # Python-generated files
+# ==============================================================================
+
 __pycache__/
-*.py[oc]
+*.py[cod]
+*$py.class
 build/
 dist/
 wheels/
-*.egg-info
+*.egg-info/
+*.egg
 
+# ==============================================================================
 # Virtual environments
-.venv
+# ==============================================================================
 
-# file with deployment values
-script/values.sh
+.venv/
+venv/
+ENV/
 
-# Credentials and secrets
-.env
-gcp_credentials.json
-orchestrator-settings.json
+# ==============================================================================
+# IDE and editor files
+# ==============================================================================
+
+.vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# ==============================================================================
+# UV package manager
+# ==============================================================================
+
+# uv.lock is tracked — remove the line below if you want to lock dependencies
+# uv.lock
+
+# ==============================================================================
+# Cloud Build / deployment artifacts
+# ==============================================================================
+
+.cloudbuild/
+*.tar.gz
+*.zip
