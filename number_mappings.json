@@ -1,0 +1,14 @@
+{
+  "+441527388966": {
+    "deployment_id": "projects/oslai-492217/locations/us/apps/795849bc-a3f7-4457-a20c-30bb9050754d/deployments/9616900c-b515-4b59-8104-78e3d45de097",
+    "environment": "prod"
+  },
+  "+443330389929": {
+    "deployment_id": "projects/oslai-492217/locations/us/apps/795849bc-a3f7-4457-a20c-30bb9050754d/deployments/9616900c-b515-4b59-8104-78e3d45de097",
+    "environment": "prod"
+  },
+  "+447878757844": {
+    "deployment_id": "projects/oslai-492217/locations/us/apps/795849bc-a3f7-4457-a20c-30bb9050754d/deployments/9616900c-b515-4b59-8104-78e3d45de097",
+    "environment": "prod"
+  }
+}
