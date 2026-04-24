@@ -1,17 +1,23 @@
 """
 Twilio Configuration Helper — verify, validate, automate, and test.
 
-This script programmatically inspects the Twilio account setup,
+This module programmatically inspects the Twilio account setup,
 revealing phone numbers, capabilities, webhooks, messaging services,
 and RCS configuration. It validates the setup against what the
 CES Twilio Adapter requires and flags any gaps.
 
 Usage:
-    python twilio_config.py              # Full inspection
-    python twilio_config.py --json       # Machine-readable output
-    python twilio_config.py --check      # Validation only (exit 0/1)
-    python twilio_config.py --numbers    # Phone numbers only
-    python twilio_config.py --webhooks   # Webhook audit only
+    python -m helpers.twilio.config              # Full inspection
+    python -m helpers.twilio.config --json       # Machine-readable output
+    python -m helpers.twilio.config --check      # Validation only (exit 0/1)
+    python -m helpers.twilio.config --numbers    # Phone numbers only
+    python -m helpers.twilio.config --webhooks   # Webhook audit only
+
+As a library:
+    from helpers.twilio import inspect, TwilioSetup
+    setup: TwilioSetup = inspect()
+    for v in setup.validations:
+        print(v.status, v.message)
 """
 
 import argparse
@@ -32,6 +38,9 @@ from twilio.rest import Client
 ADAPTER_VOICE_ENDPOINT = "/incoming-call"
 ADAPTER_MESSAGE_ENDPOINT = "/incoming-message"
 ADAPTER_MEDIA_STREAM = "/media-stream"
+
+# Resolve the project root (two levels up from this file)
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -120,10 +129,8 @@ def _get_client() -> Client:
     auth = os.getenv("TWILIO_AUTH_TOKEN")
 
     if not sid or not auth:
-        # Try orchestrator-settings.json
-        settings_path = os.path.join(
-            os.path.dirname(__file__), "orchestrator-settings.json"
-        )
+        # Try orchestrator-settings.json in project root
+        settings_path = os.path.join(_PROJECT_ROOT, "orchestrator-settings.json")
         if os.path.exists(settings_path):
             with open(settings_path) as f:
                 settings = json.load(f)
@@ -200,7 +207,9 @@ def fetch_messaging_services(client: Client) -> list[MessagingServiceInfo]:
     return services
 
 
-def fetch_conversations_services(client: Client) -> list[ConversationsServiceInfo]:
+def fetch_conversations_services(
+    client: Client,
+) -> list[ConversationsServiceInfo]:
     services = []
     try:
         for cs in client.conversations.v1.services.list(limit=100):
@@ -222,11 +231,63 @@ def fetch_conversations_services(client: Client) -> list[ConversationsServiceInf
 
 
 def _adapter_hostname() -> str:
+    """Return the default adapter hostname from PUBLIC_SERVER_HOSTNAME env var."""
     load_dotenv()
     return os.getenv("PUBLIC_SERVER_HOSTNAME", "")
 
 
+def _load_number_mappings() -> dict:
+    """Load the number_mappings.json file, returning empty dict if not found."""
+    mapping_file = os.getenv("NUMBERS_CONFIG_FILE", "number_mappings.json")
+    mapping_path = os.path.join(_PROJECT_ROOT, mapping_file)
+    if os.path.exists(mapping_path):
+        with open(mapping_path) as f:
+            return json.load(f)
+    return {}
+
+
+def _resolve_webhook_base_url(phone_number: str) -> str:
+    """Resolve the webhook base URL for a specific phone number.
+
+    Resolution order:
+      1. Per-number ``webhook_base_url`` in number_mappings.json
+      2. Global ``PUBLIC_SERVER_HOSTNAME`` env var (the default adapter)
+
+    This allows different numbers to point to different Cloud Run instances
+    while defaulting to the current adapter when no override is specified.
+    """
+    mappings = _load_number_mappings()
+    entry = mappings.get(phone_number, {})
+    per_number_url = entry.get("webhook_base_url")
+    if per_number_url:
+        return per_number_url
+    return _adapter_hostname()
+
+
+def _expected_voice_url(phone_number: str) -> str:
+    """Return the expected voice webhook URL for a specific phone number."""
+    base = _resolve_webhook_base_url(phone_number)
+    if not base:
+        return ""
+    scheme = "https://" if not base.startswith("http") else ""
+    return f"{scheme}{base}{ADAPTER_VOICE_ENDPOINT}"
+
+
+def _expected_message_url(phone_number: str) -> str:
+    """Return the expected message webhook URL for a specific phone number."""
+    base = _resolve_webhook_base_url(phone_number)
+    if not base:
+        return ""
+    scheme = "https://" if not base.startswith("http") else ""
+    return f"{scheme}{base}{ADAPTER_MESSAGE_ENDPOINT}"
+
+
 def _expected_adapter_voice_url() -> str:
+    """Return the expected voice URL based on the default adapter hostname.
+
+    Kept for backward compatibility; prefer ``_expected_voice_url(number)``
+    for per-number resolution.
+    """
     hostname = _adapter_hostname()
     if not hostname:
         return ""
@@ -235,6 +296,11 @@ def _expected_adapter_voice_url() -> str:
 
 
 def _expected_adapter_message_url() -> str:
+    """Return the expected message URL based on the default adapter hostname.
+
+    Kept for backward compatibility; prefer ``_expected_message_url(number)``
+    for per-number resolution.
+    """
     hostname = _adapter_hostname()
     if not hostname:
         return ""
@@ -243,10 +309,10 @@ def _expected_adapter_message_url() -> str:
 
 
 def validate_phone_numbers(setup: TwilioSetup) -> None:
-    expected_voice = _expected_adapter_voice_url()
-    expected_msg = _expected_adapter_message_url()
-
     for pn in setup.phone_numbers:
+        expected_voice = _expected_voice_url(pn.phone_number)
+        expected_msg = _expected_message_url(pn.phone_number)
+
         # Voice webhook check
         if pn.capabilities["voice"]:
             if not pn.voice_url:
@@ -257,14 +323,20 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
                             f"{pn.phone_number}: voice capability "
                             f"but no voice webhook configured"
                         ),
-                        details={"phone_number": pn.phone_number, "sid": pn.sid},
+                        details={
+                            "phone_number": pn.phone_number,
+                            "sid": pn.sid,
+                        },
                     )
                 )
             elif expected_voice and pn.voice_url != expected_voice:
                 setup.validations.append(
                     ValidationResult(
                         status=Status.WARN,
-                        message=f"{pn.phone_number}: voice webhook points elsewhere",
+                        message=(
+                            f"{pn.phone_number}: voice webhook "
+                            f"points elsewhere"
+                        ),
                         details={
                             "phone_number": pn.phone_number,
                             "current": pn.voice_url,
@@ -277,7 +349,8 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
                     ValidationResult(
                         status=Status.OK,
                         message=(
-                            f"{pn.phone_number}: voice webhook " f"correctly configured"
+                            f"{pn.phone_number}: voice webhook "
+                            f"correctly configured"
                         ),
                         details={"voice_url": pn.voice_url},
                     )
@@ -301,14 +374,20 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
                             f"{pn.phone_number}: SMS capability "
                             f"but no SMS webhook configured"
                         ),
-                        details={"phone_number": pn.phone_number, "sid": pn.sid},
+                        details={
+                            "phone_number": pn.phone_number,
+                            "sid": pn.sid,
+                        },
                     )
                 )
             elif expected_msg and pn.sms_url != expected_msg:
                 setup.validations.append(
                     ValidationResult(
                         status=Status.WARN,
-                        message=f"{pn.phone_number}: SMS webhook points elsewhere",
+                        message=(
+                            f"{pn.phone_number}: SMS webhook "
+                            f"points elsewhere"
+                        ),
                         details={
                             "phone_number": pn.phone_number,
                             "current": pn.sms_url,
@@ -320,7 +399,10 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
                 setup.validations.append(
                     ValidationResult(
                         status=Status.OK,
-                        message=f"{pn.phone_number}: SMS webhook correctly configured",
+                        message=(
+                            f"{pn.phone_number}: SMS webhook "
+                            f"correctly configured"
+                        ),
                         details={"sms_url": pn.sms_url},
                     )
                 )
@@ -335,7 +417,7 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
 
     # Number mapping coverage
     mapping_file = os.getenv("NUMBERS_CONFIG_FILE", "number_mappings.json")
-    mapping_path = os.path.join(os.path.dirname(__file__), mapping_file)
+    mapping_path = os.path.join(_PROJECT_ROOT, mapping_file)
     if os.path.exists(mapping_path):
         with open(mapping_path) as f:
             mappings = json.load(f)
@@ -346,7 +428,10 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
             setup.validations.append(
                 ValidationResult(
                     status=Status.WARN,
-                    message=f"Twilio numbers not in {mapping_file}: {sorted(unmapped)}",
+                    message=(
+                        f"Twilio numbers not in {mapping_file}: "
+                        f"{sorted(unmapped)}"
+                    ),
                     details={"unmapped": sorted(unmapped)},
                 )
             )
@@ -354,7 +439,8 @@ def validate_phone_numbers(setup: TwilioSetup) -> None:
             setup.validations.append(
                 ValidationResult(
                     status=Status.OK,
-                    message=f"All Twilio numbers have mappings in {mapping_file}",
+                    message=(f"All Twilio numbers have mappings "
+                             f"in {mapping_file}"),
                     details={"mapped": sorted(mapped_numbers)},
                 )
             )
@@ -426,7 +512,10 @@ def validate_messaging(setup: TwilioSetup) -> None:
                             f"({ms.sid}) inbound URL: "
                             f"{ms.inbound_request_url}"
                         ),
-                        details={"sid": ms.sid, "url": ms.inbound_request_url},
+                        details={
+                            "sid": ms.sid,
+                            "url": ms.inbound_request_url,
+                        },
                     )
                 )
 
@@ -434,7 +523,7 @@ def validate_messaging(setup: TwilioSetup) -> None:
         setup.validations.append(
             ValidationResult(
                 status=Status.INFO,
-                message="No conversations services configured (RCS requires one)",
+                message=("No conversations services configured " "(RCS requires one)"),
             )
         )
     else:
@@ -496,9 +585,9 @@ def print_phone_numbers(setup: TwilioSetup) -> None:
     if not setup.phone_numbers:
         print("\n  (no phone numbers found)")
         return
-    print(f"\n{'='*60}")
+    print("\n" + "=" * 60)
     print(f"  PHONE NUMBERS ({len(setup.phone_numbers)})")
-    print(f"{'='*60}")
+    print("=" * 60)
     for pn in setup.phone_numbers:
         print(f"\n  📞 {pn.phone_number}  ({pn.friendly_name})")
         print(f"     SID       : {pn.sid}")
@@ -510,31 +599,31 @@ def print_phone_numbers(setup: TwilioSetup) -> None:
         print("\n  --- Webhooks ---")
         print(f"     Voice URL : {pn.voice_url or '(not set)'}")
         print(f"     Voice Method: {pn.voice_method or '(not set)'}")
-        print(f"     Voice Fallback: {pn.voice_fallback_url or '(not set)'}")
+        print(f"     Voice Fallback: " f"{pn.voice_fallback_url or '(not set)'}")
         print(f"     SMS URL   : {pn.sms_url or '(not set)'}")
         print(f"     SMS Method: {pn.sms_method or '(not set)'}")
-        print(f"     SMS Fallback: {pn.sms_fallback_url or '(not set)'}")
+        print(f"     SMS Fallback: " f"{pn.sms_fallback_url or '(not set)'}")
         print(f"     Status CB : {pn.status_callback or '(not set)'}")
         if pn.bundle_sid:
             print(f"     Bundle SID: {pn.bundle_sid}")
 
 
 def print_messaging(setup: TwilioSetup) -> None:
-    print(f"\n{'='*60}")
+    print("\n" + "=" * 60)
     print(f"  MESSAGING SERVICES ({len(setup.messaging_services)})")
-    print(f"{'='*60}")
+    print("=" * 60)
     if not setup.messaging_services:
         print("  (none)")
     for ms in setup.messaging_services:
         print(f"\n  📨 {ms.friendly_name} ({ms.sid})")
-        print(f"     Inbound URL   : {ms.inbound_request_url or '(not set)'}")
+        print(f"     Inbound URL   : " f"{ms.inbound_request_url or '(not set)'}")
         print(f"     Inbound Method: {ms.inbound_method or '(not set)'}")
         print(f"     Phone Numbers : {len(ms.phone_number_sids)}")
         print(f"     Created       : {ms.date_created}")
 
-    print(f"\n{'='*60}")
-    print(f"  CONVERSATIONS SERVICES ({len(setup.conversations_services)})")
-    print(f"{'='*60}")
+    print("\n" + "=" * 60)
+    print(f"  CONVERSATIONS SERVICES " f"({len(setup.conversations_services)})")
+    print("=" * 60)
     if not setup.conversations_services:
         print("  (none — RCS requires a conversations service)")
     for cs in setup.conversations_services:
@@ -543,9 +632,9 @@ def print_messaging(setup: TwilioSetup) -> None:
 
 
 def print_validations(setup: TwilioSetup) -> None:
-    print(f"\n{'='*60}")
+    print("\n" + "=" * 60)
     print(f"  VALIDATION RESULTS ({len(setup.validations)})")
-    print(f"{'='*60}")
+    print("=" * 60)
     for v in setup.validations:
         icon = _STATUS_ICONS.get(v.status, "  ")
         print(f"  {icon} [{v.status.value}] {v.message}")
@@ -566,20 +655,147 @@ def print_adapter_config(setup: TwilioSetup) -> None:
     print(f"  PUBLIC_SERVER_HOSTNAME : {hostname}")
     if hostname and not hostname.startswith("http"):
         print(
-            "  Expected Voice URL     : " f"https://{hostname}{ADAPTER_VOICE_ENDPOINT}"
+            "  Default Voice URL      : "
+            f"https://{hostname}{ADAPTER_VOICE_ENDPOINT}"
         )
         print(
-            "  Expected Message URL   : "
+            "  Default Message URL    : "
             f"https://{hostname}{ADAPTER_MESSAGE_ENDPOINT}"
         )
-        print("  Expected Media Stream  : " f"wss://{hostname}{ADAPTER_MEDIA_STREAM}")
+        print("  Default Media Stream   : "
+              f"wss://{hostname}{ADAPTER_MEDIA_STREAM}")
     print(f"  NUMBERS_CONFIG_FILE    : {mapping_file or '(not set)'}")
     print(f"  NUMBERS_COLLECTION_ID  : {collection_id or '(not set)'}")
-    print(f"  AUTH_TOKEN_SECRET_PATH : {auth_secret or '(not set — using ADC)'}")
+    print(f"  AUTH_TOKEN_SECRET_PATH : "
+          f"{auth_secret or '(not set — using ADC)'}")
     print(
         "  GOOGLE_APPLICATION_CREDENTIALS: "
         f"{os.getenv('GOOGLE_APPLICATION_CREDENTIALS', '(not set)')}"
     )
+
+    # Show per-number webhook targets from mapping file
+    mappings = _load_number_mappings()
+    if mappings:
+        print("\n  --- Per-Number Webhook Targets ---")
+        for number, entry in sorted(mappings.items()):
+            if number.startswith("_"):
+                continue  # skip metadata keys like _defaults
+            label = entry.get("label", "")
+            base_url = _resolve_webhook_base_url(number)
+            has_override = "webhook_base_url" in entry
+            override_tag = " (override)" if has_override else " (default)"
+            if base_url and not base_url.startswith("http"):
+                base_url = f"https://{base_url}"
+            print(f"  {number} [{label}]{override_tag}")
+            print(f"    voice  -> {base_url}{ADAPTER_VOICE_ENDPOINT}")
+            print(f"    sms    -> {base_url}{ADAPTER_MESSAGE_ENDPOINT}")
+
+
+# ---------------------------------------------------------------------------
+# Webhook wiring
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class WireResult:
+    """Result of wiring a single phone number's webhook."""
+    phone_number: str
+    label: str
+    voice_url_set: str | None = None
+    sms_url_set: str | None = None
+    skipped: str | None = None  # reason for skipping, if any
+
+
+def configure_webhooks(
+    client: Client | None = None,
+    dry_run: bool = False,
+    voice_only: bool = False,
+) -> list[WireResult]:
+    """Configure Twilio webhooks for all numbers in the mapping file.
+
+    For each mapped phone number, resolves the target webhook URLs
+    (per-number ``webhook_base_url`` override or global ``PUBLIC_SERVER_HOSTNAME``)
+    and updates the Twilio number configuration.
+
+    Args:
+        client: Optional Twilio client (created from env if not provided).
+        dry_run: If True, print what would be done without making changes.
+        voice_only: If True, only configure voice webhooks (skip SMS).
+
+    Returns:
+        List of WireResult objects describing what was done.
+    """
+    if client is None:
+        client = _get_client()
+
+    mappings = _load_number_mappings()
+    if not mappings:
+        print("No number mappings found. Configure number_mappings.json first.")
+        return []
+
+    # Fetch current Twilio numbers for SID lookup
+    twilio_numbers = {str(pn.phone_number): pn for pn in fetch_phone_numbers(client)}
+
+    results: list[WireResult] = []
+
+    for number, entry in sorted(mappings.items()):
+        if number.startswith("_"):
+            continue  # skip metadata keys
+
+        label = entry.get("label", "")
+        result = WireResult(phone_number=number, label=label)
+
+        # Resolve target URLs for this number
+        voice_target = _expected_voice_url(number)
+        sms_target = _expected_message_url(number)
+
+        twilio_pn = twilio_numbers.get(number)
+        if not twilio_pn:
+            result.skipped = "number not found on Twilio account"
+            results.append(result)
+            continue
+
+        # Determine what needs changing
+        update_kwargs: dict[str, Any] = {}
+
+        # Voice webhook
+        if voice_target:
+            if twilio_pn.capabilities.get("voice"):
+                if twilio_pn.voice_url != voice_target:
+                    update_kwargs["voice_url"] = voice_target
+                    update_kwargs["voice_method"] = "POST"
+            else:
+                result.skipped = "no voice capability"
+
+        # SMS webhook
+        if sms_target and not voice_only:
+            if twilio_pn.capabilities.get("sms"):
+                if twilio_pn.sms_url != sms_target:
+                    update_kwargs["sms_url"] = sms_target
+                    update_kwargs["sms_method"] = "POST"
+
+        if not update_kwargs:
+            result.skipped = "already correctly configured"
+            results.append(result)
+            continue
+
+        # Apply changes
+        if dry_run:
+            print(f"  [DRY RUN] {number} ({label}):")
+            for key, val in update_kwargs.items():
+                print(f"    {key} = {val}")
+        else:
+            print(f"  Wiring {number} ({label})...")
+            for key, val in update_kwargs.items():
+                print(f"    {key} = {val}")
+            client.incoming_phone_numbers(twilio_pn.sid).update(**update_kwargs)
+            print(f"    Done.")
+
+        result.voice_url_set = update_kwargs.get("voice_url")
+        result.sms_url_set = update_kwargs.get("sms_url")
+        results.append(result)
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -611,10 +827,14 @@ def inspect() -> TwilioSetup:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Twilio Configuration Helper — verify, validate, automate, test"
+        description=(
+            "Twilio Configuration Helper — " "verify, validate, automate, test"
+        )
     )
     parser.add_argument(
-        "--json", action="store_true", help="Output as JSON (machine-readable)"
+        "--json",
+        action="store_true",
+        help="Output as JSON (machine-readable)",
     )
     parser.add_argument(
         "--check",
@@ -631,7 +851,56 @@ def main() -> None:
         action="store_true",
         help="Show webhook audit only",
     )
+    parser.add_argument(
+        "--wire",
+        action="store_true",
+        help=(
+            "Wire Twilio webhooks to match the mapping file configuration. "
+            "Use --dry-run to preview without making changes."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview what --wire would do without making changes",
+    )
+    parser.add_argument(
+        "--voice-only",
+        action="store_true",
+        help="When wiring, only configure voice webhooks (skip SMS)",
+    )
     args = parser.parse_args()
+
+    # Handle --wire (and --dry-run) before inspection
+    if args.wire or args.dry_run:
+        dry_run = args.dry_run or (not args.wire and args.dry_run)
+        # If --dry-run is passed without --wire, still show preview
+        if args.dry_run and not args.wire:
+            args.wire = True
+            dry_run = True
+        print("\n" + "=" * 60)
+        print("  WEBHOOK WIRING" + (" (DRY RUN)" if dry_run else ""))
+        print("=" * 60)
+        results = configure_webhooks(
+            dry_run=dry_run,
+            voice_only=args.voice_only,
+        )
+        if results:
+            print("\n" + "=" * 60)
+            print("  RESULTS")
+            print("=" * 60)
+            for r in results:
+                if r.skipped:
+                    print(f"  ⏭️  {r.phone_number} [{r.label}]: {r.skipped}")
+                else:
+                    parts = []
+                    if r.voice_url_set:
+                        parts.append(f"voice -> {r.voice_url_set}")
+                    if r.sms_url_set:
+                        parts.append(f"sms -> {r.sms_url_set}")
+                    action = "would set" if dry_run else "set"
+                    print(f"  ✅ {r.phone_number} [{r.label}]: {action} {', '.join(parts)}")
+        return
 
     setup = inspect()
 
@@ -687,9 +956,9 @@ def main() -> None:
     warn = sum(1 for v in setup.validations if v.status == Status.WARN)
     fail = sum(1 for v in setup.validations if v.status == Status.FAIL)
     info = sum(1 for v in setup.validations if v.status == Status.INFO)
-    print(f"\n{'='*60}")
+    print("\n" + "=" * 60)
     print(f"  SUMMARY: {ok} OK | {warn} WARN | {fail} FAIL | {info} INFO")
-    print(f"{'='*60}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
