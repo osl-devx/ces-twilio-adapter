@@ -102,46 +102,27 @@ else:
 
 ### Phase 3: Deploy and Wire
 
-After deploying the adapter to Cloud Run (e.g., via `bash script/deploy.sh`), use both helpers to wire the webhooks:
+After deploying the adapter to Cloud Run (e.g., via `bash script/deploy.sh`), use the Twilio helper to wire the webhooks:
 
 ```python
-from helpers.twilio import inspect as twilio_inspect
-from helpers.gcp import inspect as gcp_inspect
+from helpers.twilio import configure_webhooks
 
-# Find the deployed adapter's URI
-gcp = gcp_inspect()
-adapter_uri = None
-for svc in gcp.cloud_run_services:
-    if "twilio-adapter" in svc.name:
-        adapter_uri = svc.uri
-        break
+# Preview what will be changed
+results = configure_webhooks(dry_run=True)
+for r in results:
+    if r.skipped:
+        print(f"{r.phone_number}: {r.skipped}")
+    else:
+        print(f"{r.phone_number}: voice={r.voice_url_set}, sms={r.sms_url_set}")
 
-if not adapter_uri:
-    print("ERROR: Adapter not found in Cloud Run")
-else:
-    # Compare with Twilio webhooks
-    twilio = twilio_inspect()
-    for pn in twilio.phone_numbers:
-        if pn.capabilities["voice"]:
-            expected = f"{adapter_uri}/incoming-call"
-            if pn.voice_url != expected:
-                print(
-                    f"ACTION NEEDED: Update {pn.phone_number} "
-                    f"voice webhook\n"
-                    f"  current: {pn.voice_url or '(not set)'}\n"
-                    f"  target:  {expected}"
-                )
+# Apply the changes
+results = configure_webhooks()
 
-        if pn.capabilities["sms"]:
-            expected = f"{adapter_uri}/incoming-message"
-            if pn.sms_url != expected:
-                print(
-                    f"ACTION NEEDED: Update {pn.phone_number} "
-                    f"SMS webhook\n"
-                    f"  current: {pn.sms_url or '(not set)'}\n"
-                    f"  target:  {expected}"
-                )
+# Or wire voice only first, then add SMS later
+results = configure_webhooks(voice_only=True)
 ```
+
+Per-number routing is automatic — the `webhook_base_url` field in `number_mappings.json` overrides the default adapter for specific numbers.
 
 ### Phase 4: Verify End-to-End
 
@@ -158,15 +139,15 @@ echo "All checks passed!"
 | **Twilio Account** | ✅ | OSL-OPS (AC8b7306bbc...), active |
 | **Phone Numbers** | ✅ | 3 numbers: +441527388966, +443330389929, +447878757844 |
 | **Number Mappings** | ✅ | All 3 mapped in `number_mappings.json` with CES deployment ID |
-| **Voice Webhooks** | ⚠️ | All 3 point to other services (not this adapter) |
-| **SMS Webhooks** | ⚠️ | +447878757844 has SMS capability but no webhook |
+| **Voice Webhooks** | ✅ | All 3 point to `ces-twilio-adapter-ds565pvuia-uc.a.run.app/incoming-call` |
+| **SMS Webhooks** | ✅ | +447878757844 points to `/incoming-message` |
 | **GCP Project** | ✅ | `oslai-492217` |
 | **Cloud Run API** | ✅ | Enabled |
 | **CES API** | ✅ | Enabled |
 | **Datastore API** | ✅ | Enabled |
 | **Secret Manager API** | ✅ | Enabled |
-| **Secret Manager Access** | ⚠️ | SA needs `roles/secretmanager.viewer` |
-| **Adapter Service** | ⚠️ | Not deployed yet |
+| **Secret Manager Access** | ✅ | SA has `roles/secretmanager.viewer` + `secretAccessor` |
+| **Adapter Service** | ✅ | `ces-twilio-adapter` deployed in us-central1 |
 
 ## CLI Reference
 
@@ -179,6 +160,9 @@ Both helpers share the same CLI pattern:
 | `--check` | Validation-only (exit 0/1) | Validation-only (exit 0/1) |
 | `--numbers` / `--services` | Phone numbers only | Cloud Run services only |
 | `--webhooks` / `--apis` | Webhook audit | Enabled APIs only |
+| `--wire` | Wire webhooks per mapping file | *(n/a)* |
+| `--dry-run` | Preview wiring (no changes) | *(n/a)* |
+| `--voice-only` | Wire voice only (skip SMS) | *(n/a)* |
 
 ## Programmatic API
 
@@ -200,11 +184,25 @@ twilio: TwilioSetup = twilio_inspect()
 gcp: GcpSetup = gcp_inspect()
 ```
 
+The Twilio helper also provides webhook automation:
+
+```python
+from helpers.twilio import configure_webhooks, WireResult
+
+# Preview changes (no side effects)
+results: list[WireResult] = configure_webhooks(dry_run=True)
+
+# Apply changes
+results = configure_webhooks()
+
+# Voice only
+results = configure_webhooks(voice_only=True)
+```
+
 ## Roadmap
 
 The helpers are designed to grow with the project. Next phases:
 
-- **Webhook automation** — Programmatically update Twilio webhooks to point to Cloud Run services
 - **Deployment automation** — Deploy the adapter to Cloud Run from the helper
 - **Secret management** — Create and manage secrets in GCP Secret Manager
 - **IAM management** — Grant required roles to service accounts

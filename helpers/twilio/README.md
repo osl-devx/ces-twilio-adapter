@@ -24,8 +24,13 @@ python -m helpers.twilio.config
 | `python -m helpers.twilio --check` | Validation-only; exit 0 if OK, 1 if issues |
 | `python -m helpers.twilio --numbers` | Phone numbers only |
 | `python -m helpers.twilio --webhooks` | Webhook audit only |
+| `python -m helpers.twilio --wire` | Wire webhooks per mapping file config |
+| `python -m helpers.twilio --dry-run` | Preview what --wire would do (no changes) |
+| `python -m helpers.twilio --wire --voice-only` | Wire voice webhooks only (skip SMS) |
 
 ## Programmatic Usage (for agents and scripts)
+
+### Inspection and Validation
 
 ```python
 from helpers.twilio import inspect, TwilioSetup, Status
@@ -58,6 +63,62 @@ has_issues = any(
     for v in setup.validations
 )
 ```
+
+### Webhook Automation
+
+```python
+from helpers.twilio import configure_webhooks, WireResult
+
+# Preview what would be done (no changes)
+results: list[WireResult] = configure_webhooks(dry_run=True)
+for r in results:
+    if r.skipped:
+        print(f"{r.phone_number}: {r.skipped}")
+    else:
+        print(f"{r.phone_number}: voice={r.voice_url_set}, sms={r.sms_url_set}")
+
+# Wire webhooks for real
+results = configure_webhooks()
+
+# Wire voice only (skip SMS)
+results = configure_webhooks(voice_only=True)
+
+# Pass an existing client
+from twilio.rest import Client
+client = Client(sid, auth_token)
+results = configure_webhooks(client=client)
+```
+
+### Per-Number Webhook Routing
+
+Each phone number can point to a different adapter (Cloud Run instance).
+Webhook targets are resolved from `number_mappings.json`:
+
+1. **Per-number override**: `webhook_base_url` field on the number's entry
+2. **Global default**: `PUBLIC_SERVER_HOSTNAME` env var
+
+```json
+{
+  "+441527388966": {
+    "label": "osl-national",
+    "deployment_id": "projects/...",
+    "environment": "prod"
+  },
+  "+447878757844": {
+    "label": "osl-mobile",
+    "deployment_id": "projects/...",
+    "environment": "prod",
+    "webhook_base_url": "different-adapter-xxx.uc.a.run.app"
+  }
+}
+```
+
+In this example:
+- `+441527388966` uses the default adapter (`PUBLIC_SERVER_HOSTNAME`)
+- `+447878757844` overrides to a different Cloud Run instance
+
+The `--wire` command and `configure_webhooks()` respect this resolution order
+automatically — no extra flags needed.
 
 ## What It Inspects
 
@@ -92,7 +153,8 @@ has_issues = any(
 | Number mapping gap | WARN | A Twilio number is not in `number_mappings.json` |
 | Stale mapping | WARN | A number in `number_mappings.json` is not on Twilio |
 | No mapping configured | FAIL | Neither `NUMBERS_CONFIG_FILE` nor `NUMBERS_COLLECTION_ID` is set |
-| Messaging service no URL | WARN | Messaging service exists but has no inbound URL |
+| Messaging service no URL | WARN | Messaging service has phone numbers but no inbound URL |
+| Messaging service empty | INFO | Messaging service exists but has no phone numbers assigned |
 | No conversations service | INFO | No conversations service (required for RCS) |
 | Voice/SMS not capable | INFO | Number does not support the capability (informational) |
 
@@ -131,7 +193,6 @@ helpers/
 
 This helper is designed to grow with the project. Planned enhancements include:
 
-- Webhook configuration automation (set/update webhooks programmatically)
 - RCS sender discovery and configuration
 - `number_mappings.json` sync from live Twilio numbers
 - Deployment readiness pre-flight checks
@@ -171,26 +232,13 @@ for svc in gcp.cloud_run_services:
         print(f"Adapter deployed at: {adapter_uri}")
 
 # Step 4: Configure Twilio webhooks to point to the adapter
-# (combines data from both helpers)
-for pn in twilio.phone_numbers:
-    if pn.capabilities["voice"]:
-        expected = f"{adapter_uri}/incoming-call"
-        if pn.voice_url != expected:
-            print(
-                f"ACTION: Update {pn.phone_number} "
-                f"voice webhook\n"
-                f"  from: {pn.voice_url or '(not set)'}\n"
-                f"  to:   {expected}"
-            )
-    if pn.capabilities["sms"]:
-        expected = f"{adapter_uri}/incoming-message"
-        if pn.sms_url != expected:
-            print(
-                f"ACTION: Update {pn.phone_number} "
-                f"SMS webhook\n"
-                f"  from: {pn.sms_url or '(not set)'}\n"
-                f"  to:   {expected}"
-            )
+from helpers.twilio import configure_webhooks
+
+# Preview first
+results = configure_webhooks(dry_run=True)
+# Then wire for real
+results = configure_webhooks()
+# Per-number routing is automatic via number_mappings.json
 
 # Step 5: Verify everything is wired correctly
 # Re-run both inspections to confirm all validations pass

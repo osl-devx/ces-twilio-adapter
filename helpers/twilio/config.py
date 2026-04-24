@@ -492,15 +492,29 @@ def validate_messaging(setup: TwilioSetup) -> None:
         )
     else:
         for ms in setup.messaging_services:
-            if not ms.inbound_request_url:
+            if not ms.phone_number_sids:
+                # Messaging service with no phone numbers assigned is
+                # not routing anything — informational, not a problem.
+                setup.validations.append(
+                    ValidationResult(
+                        status=Status.INFO,
+                        message=(
+                            f"Messaging service '{ms.friendly_name}' "
+                            f"({ms.sid}) has no phone numbers assigned"
+                        ),
+                        details={"sid": ms.sid},
+                    )
+                )
+            elif not ms.inbound_request_url:
                 setup.validations.append(
                     ValidationResult(
                         status=Status.WARN,
                         message=(
                             f"Messaging service '{ms.friendly_name}' "
-                            f"({ms.sid}) has no inbound URL"
+                            f"({ms.sid}) has phone numbers but "
+                            f"no inbound URL"
                         ),
-                        details={"sid": ms.sid},
+                        details={"sid": ms.sid, "phone_count": len(ms.phone_number_sids)},
                     )
                 )
             else:
